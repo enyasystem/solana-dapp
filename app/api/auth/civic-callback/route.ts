@@ -12,56 +12,66 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: "Authorization code is required" }, { status: 400 })
     }
 
-    // In a real implementation, this would exchange the code for a token with Civic
-    // For now, we'll create a mock user
-    const mockEmail = `user-${code.slice(0, 8)}@example.com`
+    // Exchange code for Civic Auth token and user info
+    const CIVIC_CLIENT_ID = process.env.CIVIC_CLIENT_ID as string
+    const CIVIC_CLIENT_SECRET = process.env.CIVIC_CLIENT_SECRET as string
+    const CALLBACK_URL = process.env.CIVIC_CALLBACK_URL as string || `${new URL(request.url).origin}/api/auth/civic-callback`
+
+    const tokenRes = await fetch("https://auth.civic.com/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        client_id: CIVIC_CLIENT_ID,
+        client_secret: CIVIC_CLIENT_SECRET,
+        redirect_uri: CALLBACK_URL,
+      }),
+    })
+    if (!tokenRes.ok) {
+      return NextResponse.json({ error: "Failed to exchange code for token" }, { status: 500 })
+    }
+    const tokenData = await tokenRes.json()
+    const accessToken = tokenData.access_token
+
+    // Get user info from Civic
+    const userRes = await fetch("https://auth.civic.com/oauth/userinfo", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    if (!userRes.ok) {
+      return NextResponse.json({ error: "Failed to fetch user info" }, { status: 500 })
+    }
+    const userInfo = await userRes.json()
+    const email = userInfo.email
+    const name = userInfo.name || email
+    const wallet = userInfo.wallet_address
+    if (!email) {
+      return NextResponse.json({ error: "No email returned from Civic" }, { status: 500 })
+    }
 
     // Check if user exists
-    let user = await getUserByEmail(mockEmail)
-
-    // Create user if not exists
+    let user = await getUserByEmail(email)
     if (!user) {
       user = await createUser({
-        email: mockEmail,
-        name: `Test User ${mockEmail.slice(0, 5)}`,
-        picture: `https://api.dicebear.com/7.x/avataaars/svg?seed=${mockEmail}`,
+        email,
+        name,
+        picture: userInfo.picture || `https://api.dicebear.com/7.x/avataaars/svg?seed=${email}`,
       })
-
-      // Create wallet for new user
+      // Create wallet for new user (store Civic wallet address if needed)
       await createWallet(user.id)
     }
 
-    // Create a simple JWT token
-    const token = createMockJwt({
-      sub: user.id,
-      email: user.email,
-      name: user.name || undefined,
-    })
-
-    // Set session cookie (cookies() is synchronous for setting)
-    cookies().set("session_token", token, {
+    // Set session cookie using the Response API
+    const response = NextResponse.redirect(new URL("/dashboard", request.url))
+    response.cookies.set("session_token", accessToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       maxAge: 60 * 60 * 24 * 7, // 1 week
       path: "/",
     })
-
-    // Redirect to dashboard
-    return NextResponse.redirect(new URL("/dashboard", request.url))
+    return response
   } catch (error) {
     console.error("Auth callback error:", error)
     return NextResponse.json({ error: "Authentication failed" }, { status: 500 })
   }
-}
-
-// Simple mock JWT implementation
-function createMockJwt(payload: any) {
-  const header = { alg: "HS256", typ: "JWT" }
-  const encodedHeader = Buffer.from(JSON.stringify(header)).toString("base64").replace(/=/g, "")
-  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64").replace(/=/g, "")
-
-  // In a real implementation, you would sign this with a secret
-  const signature = Buffer.from("mock-signature").toString("base64").replace(/=/g, "")
-
-  return `${encodedHeader}.${encodedPayload}.${signature}`
 }
